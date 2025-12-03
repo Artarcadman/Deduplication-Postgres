@@ -19,6 +19,8 @@ DB_CONFIG = {
     "password": PASSWORD
 }
 
+CHUNK_SIZE = 4  # Size of segment
+
 # --- Input file choice ---
 def select_file(directory = "./origin_data"):
     """
@@ -41,12 +43,12 @@ def select_file(directory = "./origin_data"):
         print(f'Directory "{directory}" has no files')
         return None
     
-    print(f'Available files in "{directory}":')
+    print(f'Available files in "{directory}":\n')
     for i, file in enumerate(files):
         print(f"{i+1}. {file}")
 
     while True:
-        choice = input(f"Choose file (1 - {len(files)})")
+        choice = input(f"\nChoose file (1 - {len(files)})")
         try:
             index = int(choice)-1
             if 0 <= index < len(files):
@@ -55,18 +57,8 @@ def select_file(directory = "./origin_data"):
                 print("This file not exists. Try your BEST again")
         except ValueError:
             print("Only numbers")
-                 
-INPUT_FILENAME = select_file(directory=".\origin_data")
-if INPUT_FILENAME:
-    print(f"You work with {INPUT_FILENAME}.")
-else:
-    exit()
-
-
-# --- Algorithm ---
-
-CHUNK_SIZE = 4  # Size of segment
-
+   
+    
 def connect_db():
     """Connect to PostgreSQL"""
     try:
@@ -75,8 +67,47 @@ def connect_db():
     except Exception as e:
         print(f"Can't connect to PostgreSQL. Check PostgreSQL launcher, db name/user/password. Error: {e}")
         return None
+    
+    
+def check_file_processed(conn, filepath):
+    """Make hash of FULL file and check if it was done before"""
+    # Make HASH for file
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    full_hash = hasher.hexdigest()
+    
+    # Check HASH in database
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM processed_files WHERE file_hash = %s", (full_hash,))
+    
+    if cursor.fetchone():
+        print(f'File "{filepath}" ALREADY PROCESSED in this database!')
+        return True, full_hash
+    
+    return False, full_hash # return full_hash for insert in database for first time
 
-def process_file(conn, filename, chunk_size):
+
+def register_file(conn, filename, file_hash):
+    """Insert file record into processed_files table after succesful processing"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO processed_files (file_name, file_hash)
+            VALUES (%s, %s)
+            """, 
+            (os.path.basename(filename), file_hash)
+        )
+        conn.commit()
+        print(f'File "{filename}" succesfully registered in database')
+    except Exception as e:
+        print(f"Error registering file: {e}")
+        conn.rollback()
+
+
+def process_file_chunks(conn, filename, chunk_size):
     """
     Reading binary file (4 bytes per segment), hash-function,
     keep data segments, update/insert DATA
@@ -92,6 +123,10 @@ def process_file(conn, filename, chunk_size):
     processed_count = 0
     start_time = time.time()
     
+    print(f'Starting chunk processing. Size: {file_size} bytes...')
+    print(f'Total segment count is about {file_size/chunk_size}...')
+    
+    
     # 1. Reading file in banary (rb)
     with open(filename, 'rb') as f: 
         while True:
@@ -105,7 +140,6 @@ def process_file(conn, filename, chunk_size):
             hash_value = hash_object.hexdigest()
 
             # UPSERT: Try to update counter if we already have HASH
-            # We don't update chunk_data
             cursor.execute(
                 """
                 UPDATE file_chunks
@@ -123,7 +157,7 @@ def process_file(conn, filename, chunk_size):
                     INSERT INTO file_chunks (hash_value, file_name, segment_offset, repetition_count, chunk_data)
                     VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (hash_value, filename, segment_offset, 1, chunk) 
+                    (hash_value, os.path.basename(filename), segment_offset, 1, chunk) 
                 )
 
             segment_offset += chunk_size
@@ -145,8 +179,33 @@ def process_file(conn, filename, chunk_size):
 
 
 if __name__ == "__main__":
-    db_connection = connect_db()
     
-    if db_connection:
-        process_file(db_connection, INPUT_FILENAME, CHUNK_SIZE)
-        db_connection.close()
+    # 1. Select File
+    selected_file = select_file(directory=r".\origin_data")
+    
+    if selected_file:
+        print(f"Selected: {selected_file}")
+        
+        # 2. Connect DB
+        db_connection = connect_db()
+    
+        if db_connection:
+            try:
+                # 3. Check if it is processed
+                is_processed, file_hash = check_file_processed(db_connection, selected_file)
+                
+                if not is_processed:
+                    # 4. Process chunks (for new only)
+                    process_file_chunks(db_connection, selected_file, CHUNK_SIZE)
+                    
+                    # 5. Register file in registry
+                    register_file(db_connection, selected_file, file_hash)
+                else:
+                    print("Skipping processing")
+            except Exception as e:
+                print(f"Critical error during execution: {e}")
+            finally:
+                db_connection.close()
+                print("\nDB Connection closed")
+        else:
+            print("No file selected. Go to sleep")
