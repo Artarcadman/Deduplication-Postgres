@@ -1,0 +1,3 @@
+hashlib
+psycopg2
+dotenv
