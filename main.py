@@ -89,25 +89,29 @@ def check_file_processed(conn, filepath):
     return False, full_hash # return full_hash for insert in database for first time
 
 
-def register_file(conn, filename, file_hash):
-    """Insert file record into processed_files table after succesful processing"""
+def register_file(conn, filename, file_hash, chunk_size):
+    """Insert file record into processed_files table and return the new file_id."""
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            INSERT INTO processed_files (file_name, file_hash)
-            VALUES (%s, %s)
+            INSERT INTO files (file_name, file_hash, chunk_size)
+            VALUES (%s, %s, %s)
+            RETURNING file_id
             """, 
-            (os.path.basename(filename), file_hash)
+            (os.path.basename(filename), file_hash, chunk_size)
         )
+        file_id = cursor.fetchone()[0]
         conn.commit()
-        print(f'File "{filename}" succesfully registered in database')
+        print(f'File "{filename}" succesfully registered with ID: {file_id}')
+        return file_id
     except Exception as e:
         print(f"Error registering file: {e}")
         conn.rollback()
+        return None
 
 
-def process_file_chunks(conn, filename, chunk_size):
+def process_file_chunks(conn, filename, file_id, chunk_size):
     """
     Reading binary file (4 bytes per segment), hash-function,
     keep data segments, update/insert DATA
@@ -120,6 +124,7 @@ def process_file_chunks(conn, filename, chunk_size):
     cursor = conn.cursor()
     file_size = os.path.getsize(filename)
     segment_offset = 0  # byte offset
+    chunk_index = 0
     processed_count = 0
     start_time = time.time()
     
@@ -142,12 +147,23 @@ def process_file_chunks(conn, filename, chunk_size):
             # UPSERT: Try to update counter if we already have HASH
             cursor.execute(
                 """
-                UPDATE file_chunks
-                SET repetition_count = repetition_count + 1
-                WHERE hash_value = %s
+                INSERT INTO segments (hash_value, chunk_data, repetition_count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (hash_value) DO UPDATE
+                SET repetition_count = segments.repetition_count + 1
                 """,
-                (hash_value,)
+                (hash_value, chunk) 
             )
+            
+            cursor.execute(
+                """
+                INSERT INTO file_segments (file_id, hash_value, chunk_index)
+                VALUES (%s, %s, %s)
+                """,
+                (file_id, hash_value, chunk_index)
+            )
+            
+            chunk_index += 1
 
             #  If hash is new, do INSERT
             if cursor.rowcount == 0:
@@ -177,7 +193,46 @@ def process_file_chunks(conn, filename, chunk_size):
     print(f"   Total segments count: {processed_count}")
     print("-" * 40)
 
-
+def restore_file(conn, file_name: str, target_directory="./restored_data"):
+    
+    cursor = conn.cursor()
+    restored_path = os.path.join(target_directory, f"RESTORED_{file_name}")
+    
+    if not os.path.exists(target_directory):
+        os.makedirs(target_directory)
+    print(f'Start file restoration for "{file_name}"')
+    
+    
+    try:
+        query = """
+        SELECT S.chunk_data
+        FROM files F
+        JOIN file_segments FS ON F.file_id = FS.file_id
+        JOIN segments S ON FS.hash_value = S.hash_value
+        WHERE F.file_name = %s
+        ORDER BY FS.chunk_index ASC;
+        """
+        cursor.execute(query, (file_name,))
+        
+        results = cursor.fetchall()
+        
+        if not results:
+            print(f'Error: File "{file_name}" not found or has no segments')
+            return None
+        
+        with open(restored_path, "wb") as f:
+            for segment_row in results:
+                f.write(segment_row[0])
+                
+        print(f"Restoration succesful!!")
+        print(f'Restored file saved to "{restored_path}"')
+        print(f'Total segments read: {len(results)}')
+        
+        return restored_path
+    except Exception as e:
+        print(f'Error during file restoration: {e}')
+        return None
+        
 if __name__ == "__main__":
     
     # 1. Select File
@@ -185,6 +240,7 @@ if __name__ == "__main__":
     
     if selected_file:
         print(f"Selected: {selected_file}")
+        file_base_name = os.path.basename(selected_file)
         
         # 2. Connect DB
         db_connection = connect_db()
@@ -196,12 +252,17 @@ if __name__ == "__main__":
                 
                 if not is_processed:
                     # 4. Process chunks (for new only)
-                    process_file_chunks(db_connection, selected_file, CHUNK_SIZE)
+                    file_id = register_file(db_connection, selected_file, file_hash, CHUNK_SIZE)
                     
-                    # 5. Register file in registry
-                    register_file(db_connection, selected_file, file_hash)
+                    if file_id is not None:
+                        # 5. Process chunks (for new only)
+                        process_file_chunks(db_connection, selected_file, file_id, CHUNK_SIZE)
                 else:
                     print("Skipping processing")
+                    
+                # 6. Restoration file
+                restore_file(db_connection, file_base_name)
+                
             except Exception as e:
                 print(f"Critical error during execution: {e}")
             finally:
@@ -209,3 +270,9 @@ if __name__ == "__main__":
                 print("\nDB Connection closed")
         else:
             print("No file selected. Go to sleep")
+            
+            # Восстанавливать данные
+            # Искать дубли по всей бд а не по файлу
+            # Разбить так чтобы сегменты хранились отдельно в каком-то файле. Потом доставать сегменты из этого файла и собирать заново файлы
+            # Исследование по размерам файлов например
+            
